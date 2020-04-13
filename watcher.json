@@ -1,0 +1,11 @@
+{
+  "server": {
+    "host": "levi.mhadev.ca",
+    "port": "20202"
+  },
+  "localRoot": "/home/levi/myhealthaccess",
+  "remoteRoot": "/opt/myhealthaccess/myhealthaccess",
+  "paths": [
+    "client/src"
+  ]
+}
