@@ -1,13 +1,18 @@
 use std::net::TcpStream;
 use ssh2::Session;
 use notify::{RecommendedWatcher, RecursiveMode, Result, Watcher, Event, EventKind};
-use std::path::{PathBuf};
 use std::io::Read;
 use serde::Deserialize;
 use std::fs::File;
-use path_abs::{PathAbs, PathDir, PathOps};
+use path_abs::{PathAbs, PathOps, PathInfo};
 use path_abs::ser::ToStfu8;
-use notify::event::ModifyKind;
+use notify::event::{ModifyKind, CreateKind, MetadataKind};
+use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::thread;
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +42,6 @@ impl Config {
 
 fn main() {
     let config = get_config();
-    println!("{:?}", config);
 
     match establish_connection(config.ssh_endpoint()) {
         Err(err) => println!("{}", err),
@@ -46,7 +50,8 @@ fn main() {
 }
 
 fn watch(mut session: Session, config: Config) {
-    let (sender, receiver) = std::sync::mpsc::channel::<Result<Event>>();
+    let (sender, receiver) = mpsc::channel::<Result<Event>>();
+    let (tx, rx) = mpsc::channel();
 
     let mut watcher: RecommendedWatcher = Watcher::new_immediate(move |res| {
         sender.send(res).unwrap()
@@ -56,41 +61,152 @@ fn watch(mut session: Session, config: Config) {
         watcher.watch(path, RecursiveMode::Recursive).unwrap();
     }
 
-    // TODO: Timeout on file changes
+    // File is being deleted -> ignore_set -> touch + rm
+    // File is being created and exists in ignore_set -> remove from ignore_set + touch
+
+    let change_map: Arc<Mutex<HashMap<PathBuf, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let rm_map = Arc::new(Mutex::new(HashMap::new()));
+    let timeout_active = Arc::new(AtomicBool::new(false));
+
+    // TODO: Fix too many file changes -- figure out max limit
+    thread::spawn({
+        let c_clone = Arc::clone(&change_map);
+        let r_clone = Arc::clone(&rm_map);
+        let t_clone = Arc::clone(&timeout_active);
+
+        move || {
+            let mut ignore_set = HashSet::new();
+
+            for res in rx {
+                if !t_clone.load(Ordering::Relaxed) {
+                    println!("Spawning timeout..");
+                    t_clone.store(true, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(100));
+
+                    let mut c_map = c_clone.lock().unwrap();
+                    let mut r_map = r_clone.lock().unwrap();
+
+                    let mut changed = String::new();
+                    let mut removed = String::new();
+
+                    let mut skip = true;
+
+                    for (k, v) in c_map.iter() {
+                        let k = k.clone();
+                        let v = v.clone();
+
+                        if ignore_set.contains(&k) {
+                            ignore_set.remove(&k);
+                        } else {
+                            skip = false;
+                            let format = format!("{} ", &v.as_str());
+                            changed += &format.as_str();
+
+                            if r_map.contains_key(&k) {
+                                removed += &format.as_str();
+                                ignore_set.insert(k);
+                            }
+                        }
+
+                    }
+
+                    if !skip {
+                        println!("Executing! c_map: {} r_map: {}", c_map.len(), r_map.len());
+                        execute_remote(&mut session, format!("touch -a {} ; rm -f {}", changed, removed));
+                    }
+
+                    c_map.clear();
+                    r_map.clear();
+                    t_clone.store(false, Ordering::Relaxed);
+                    println!("Timeout finished!");
+                }
+            }
+        }
+    });
+
     for res in receiver {
         match res {
-            Ok(event) => handle_event(&mut session, event, &config),
             Err(err) => println!("watch error: {:?}", err),
+            Ok(event) => {
+                let path_buf = event.paths.first().unwrap().clone();
+                let kind = &event.kind;
+
+                if kind.is_remove() || kind.is_create() || kind.is_modify() {
+                    let meta_update = match kind {
+                        EventKind::Modify(ModifyKind::Metadata(_)) => true,
+                        _ => false,
+                    };
+
+                    if !meta_update {
+                        let file_name = (&path_buf).file_name().unwrap().to_str().unwrap();
+
+                        let mut c_map = change_map.lock().unwrap();
+                        let mut r_map = rm_map.lock().unwrap();
+
+                        if !c_map.contains_key(&path_buf) {
+                            println!("1 | {} | change_map doesn't contain", &file_name);
+                            if let Some(file) = remote_path(&config, &path_buf) {
+                                println!("1 | {} | Adding to change_map", &file_name);
+                                &c_map.insert(path_buf.clone(), file.clone());
+
+                                if kind.is_remove() {
+                                    println!("2 | {} | Adding to rm_map", &file_name);
+                                    &r_map.insert(path_buf.clone(), file.clone());
+                                }
+
+                                if !timeout_active.load(Ordering::Relaxed) {
+                                    tx.send(true).unwrap();
+                                }
+                            }
+                        }
+                    }
+                }
+            },
         }
     }
 }
 
-fn handle_event(session: &mut Session, event: Event, config: &Config) {
-    match event.kind {
-        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)) => {
-            let path_buf = event.paths.first().unwrap();
-            let path = PathAbs::new_unchecked(path_buf.to_owned()).to_stfu8();
+fn trigger_update(session: &mut Session,
+                  change_map: &HashMap<PathBuf, String>,
+                  rm_map: &HashMap<PathBuf, String>) {
 
-            if !path.ends_with("~") {
-                let remote_path = config.to_remote_path(&path);
-                println!("Updating {}: {}", path, remote_path);
+    let mut changed = String::new();
 
-                execute_remote(session, format!("touch -a {}", remote_path));
-            }
-
-        },
-        _ => (),
+    for file in change_map.values() {
+        changed += format!("{} ", file).as_str();
     }
+
+    let mut command = format!("touch -a {}", changed);
+
+    if !rm_map.is_empty() {
+        let mut removed = String::new();
+
+        for file in rm_map.values() {
+            removed += format!("{} ", file).as_str();
+        }
+
+        command = format!("{} && rm {}", command, removed);
+    }
+
+    execute_remote(session, command);
+}
+
+fn remote_path(config: &Config, path_buf: &PathBuf) -> Option<String> {
+    let path = PathAbs::new_unchecked(path_buf.to_owned()).to_stfu8();
+
+    // Jetbrains IDE temp file
+    if !path.ends_with("~") {
+        return Some(config.to_remote_path(&path))
+    }
+
+    None
 }
 
 fn execute_remote(session: &mut Session, command: String) {
     if session.authenticated() {
         let mut channel = session.channel_session().unwrap();
+        println!("Remote: {}", command);
         channel.exec(command.as_str()).unwrap();
-        let mut s = String::new();
-        channel.read_to_string(&mut s).unwrap();
-        println!("{}", s);
-        channel.wait_close().unwrap();
     }
 
 }
@@ -129,20 +245,7 @@ fn get_config() -> Config {
     config.local_root = local_root.to_stfu8();
     config.paths = paths.into_iter().map(|dir| {
         PathAbs::new(local_root.join(dir)).unwrap().to_stfu8()
-//        PathAbs::from(&local_root(dir)).to_stfu8()
     }).collect();
 
     config
 }
-
-//fn join_paths(path1: &String, path2: String) -> String {
-//    get_path_string(&PathBuf::from(path1).join(PathBuf::from(path2)))
-//}
-
-//fn get_path_string(path: &PathBuf) -> String {
-//    path.canonicalize()
-//        .unwrap()
-//        .into_os_string()
-//        .into_string()
-//        .unwrap()
-//}
